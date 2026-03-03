@@ -12,6 +12,12 @@ import {
   openAiError,
   parseRetryAfterMs,
 } from "./lib/proxy.js";
+import {
+  chatCompletionToSse,
+  chatRequestToResponsesRequest,
+  responsesToChatCompletion,
+  shouldUseResponsesUpstream,
+} from "./lib/responses-compat.js";
 
 interface ChatCompletionRequest {
   readonly model?: string;
@@ -98,8 +104,15 @@ export async function createApp(config: ProxyConfig): Promise<FastifyInstance> {
       return;
     }
 
-    const upstreamUrl = new URL(config.chatCompletionsPath, `${config.upstreamBaseUrl}/`).toString();
-    const bodyText = JSON.stringify(request.body);
+    const requestedModel = typeof request.body.model === "string" ? request.body.model : "";
+    const useResponsesUpstream = shouldUseResponsesUpstream(requestedModel, config.responsesModelPrefixes);
+    const upstreamPath = useResponsesUpstream ? config.responsesPath : config.chatCompletionsPath;
+    const upstreamUrl = new URL(upstreamPath, `${config.upstreamBaseUrl}/`).toString();
+    const upstreamPayload = useResponsesUpstream
+      ? chatRequestToResponsesRequest(request.body)
+      : request.body;
+    const bodyText = JSON.stringify(upstreamPayload);
+    const clientWantsStream = request.body.stream === true;
 
     let keys: string[];
     try {
@@ -131,6 +144,7 @@ export async function createApp(config: ProxyConfig): Promise<FastifyInstance> {
 
     let sawRateLimit = false;
     let sawRequestError = false;
+    let sawUpstreamServerError = false;
 
     for (const apiKey of keys) {
       const upstreamHeaders = buildUpstreamHeaders(request.headers, apiKey);
@@ -162,6 +176,53 @@ export async function createApp(config: ProxyConfig): Promise<FastifyInstance> {
           "rate limited by upstream key; trying next key"
         );
         continue;
+      }
+
+      if (upstreamResponse.status >= 500 && upstreamResponse.status <= 599) {
+        sawUpstreamServerError = true;
+        keyPool.markRateLimited(apiKey, Math.min(config.keyCooldownMs, 5000));
+
+        request.log.warn(
+          {
+            status: upstreamResponse.status,
+            keySuffix: apiKey.slice(-6)
+          },
+          "upstream server error for key; trying next key"
+        );
+
+        try {
+          await upstreamResponse.arrayBuffer();
+        } catch {
+          // Ignore body read failures while failing over.
+        }
+
+        continue;
+      }
+
+      if (useResponsesUpstream && upstreamResponse.ok) {
+        let responsesJson: unknown;
+        try {
+          responsesJson = await upstreamResponse.json();
+        } catch (error) {
+          sawRequestError = true;
+          request.log.warn({ error: toErrorMessage(error) }, "failed to parse responses upstream JSON");
+          continue;
+        }
+
+        const chatCompletion = responsesToChatCompletion(responsesJson, requestedModel);
+        if (clientWantsStream) {
+          reply.code(200);
+          reply.header("content-type", "text/event-stream; charset=utf-8");
+          reply.header("cache-control", "no-cache");
+          reply.header("x-accel-buffering", "no");
+          reply.send(chatCompletionToSse(chatCompletion));
+          return;
+        }
+
+        reply.code(upstreamResponse.status);
+        reply.header("content-type", "application/json");
+        reply.send(chatCompletion);
+        return;
       }
 
       reply.code(upstreamResponse.status);
@@ -200,6 +261,19 @@ export async function createApp(config: ProxyConfig): Promise<FastifyInstance> {
             "No upstream key succeeded. Keys may be rate-limited or temporarily unavailable.",
             "rate_limit_error",
             "no_available_key"
+          )
+        );
+      return;
+    }
+
+    if (sawUpstreamServerError) {
+      reply
+        .code(502)
+        .send(
+          openAiError(
+            "Upstream returned transient server errors across all available keys.",
+            "server_error",
+            "upstream_server_error"
           )
         );
       return;

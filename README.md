@@ -1,10 +1,11 @@
 # VivGrid OpenAI Proxy
 
-OpenAI-compatible proxy server for VivGrid chat completions with automatic API key rotation.
+OpenAI-compatible proxy server for VivGrid with automatic API key rotation.
 
 ## Features
 
-- `POST /v1/chat/completions` passthrough for text and multimodal payloads (image/video/audio/pdf fields are forwarded unchanged).
+- `POST /v1/chat/completions` compatibility endpoint.
+- Model-aware upstream routing: `gpt-*` models can be sent to VivGrid `POST /v1/responses` and converted back into chat-completions format.
 - `GET /v1/models` and `GET /v1/models/:id` model listing.
 - Automatic key rotation when upstream returns rate limits (`429`, plus `403/503` with `retry-after`).
 - Key pool loaded from JSON file so you can maintain many upstream keys.
@@ -32,6 +33,8 @@ pnpm --filter @workspace/vivgrid-openai-proxy start
 - `PROXY_PORT` (default: `8787`)
 - `UPSTREAM_BASE_URL` (default: `https://api.vivgrid.com`)
 - `UPSTREAM_CHAT_COMPLETIONS_PATH` (default: `/v1/chat/completions`)
+- `UPSTREAM_RESPONSES_PATH` (default: `/v1/responses`)
+- `UPSTREAM_RESPONSES_MODEL_PREFIXES` (default: `gpt-`; comma-separated prefixes)
 - `VIVGRID_KEYS_FILE` (default: `./keys.json`)
 - `VIVGRID_MODELS_FILE` (default: `./models.json`)
 - `VIVGRID_KEY_RELOAD_MS` (default: `5000`)

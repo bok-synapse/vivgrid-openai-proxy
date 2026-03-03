@@ -72,6 +72,8 @@ async function withProxyApp(
     port: 0,
     upstreamBaseUrl: `http://127.0.0.1:${address.port}`,
     chatCompletionsPath: "/v1/chat/completions",
+    responsesPath: "/v1/responses",
+    responsesModelPrefixes: ["gpt-"],
     keysFilePath: keysPath,
     modelsFilePath: modelsPath,
     keyReloadMs: 50,
@@ -193,6 +195,378 @@ test("returns 429 when every key is rate-limited", async () => {
       assert.ok(isRecord(payload));
       assert.ok(isRecord(payload.error));
       assert.equal(payload.error.code, "no_available_key");
+    }
+  );
+});
+
+test("retries with next key when upstream returns 500", async () => {
+  const observedKeys: string[] = [];
+
+  await withProxyApp(
+    {
+      keys: ["key-a", "key-b"],
+      upstreamHandler: async (request) => {
+        const auth = request.headers.authorization;
+        if (typeof auth === "string") {
+          observedKeys.push(auth.replace(/^Bearer\s+/i, ""));
+        }
+
+        if (auth === "Bearer key-a") {
+          return {
+            status: 500,
+            headers: {
+              "content-type": "application/json"
+            },
+            body: JSON.stringify({ error: { message: "temporary upstream error" } })
+          };
+        }
+
+        return {
+          status: 200,
+          headers: {
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({ id: "chatcmpl-500-fallback", object: "chat.completion", choices: [] })
+        };
+      }
+    },
+    async ({ app }) => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/chat/completions",
+        headers: {
+          "content-type": "application/json"
+        },
+        payload: {
+          model: "gemini-3.1-pro-preview",
+          messages: [{ role: "user", content: "hello" }],
+          stream: false
+        }
+      });
+
+      assert.equal(response.statusCode, 200);
+      const payload: unknown = response.json();
+      assert.ok(isRecord(payload));
+      assert.equal(payload.id, "chatcmpl-500-fallback");
+      assert.deepEqual(observedKeys, ["key-a", "key-b"]);
+    }
+  );
+});
+
+test("routes gpt chat requests to responses endpoint and maps response", async () => {
+  let observedPath = "";
+  let observedBody: unknown;
+
+  await withProxyApp(
+    {
+      keys: ["key-a"],
+      upstreamHandler: async (request, body) => {
+        observedPath = request.url ?? "";
+        observedBody = JSON.parse(body);
+
+        return {
+          status: 200,
+          headers: {
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            id: "resp_abc",
+            object: "response",
+            created_at: 1772516800,
+            model: "gpt-5.3-codex",
+            output: [
+              {
+                id: "msg_abc",
+                type: "message",
+                role: "assistant",
+                content: [
+                  {
+                    type: "output_text",
+                    text: "responses-route-ok"
+                  }
+                ]
+              }
+            ],
+            usage: {
+              input_tokens: 9,
+              output_tokens: 4,
+              total_tokens: 13
+            }
+          })
+        };
+      }
+    },
+    async ({ app }) => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/chat/completions",
+        headers: {
+          "content-type": "application/json"
+        },
+        payload: {
+          model: "gpt-5.3-codex",
+          messages: [{ role: "user", content: "hello" }],
+          stream: false,
+          max_tokens: 256,
+          reasoningEffort: "high",
+          reasoningSummary: "auto",
+          textVerbosity: "low",
+          include: ["reasoning.encrypted_content"],
+          tools: [
+            {
+              type: "function",
+              function: {
+                name: "bash",
+                description: "Run shell command",
+                parameters: {
+                  type: "object",
+                  properties: {
+                    command: {
+                      type: "string"
+                    }
+                  },
+                  required: ["command"],
+                  additionalProperties: false
+                }
+              }
+            }
+          ],
+          tool_choice: {
+            type: "function",
+            function: {
+              name: "bash"
+            }
+          }
+        }
+      });
+
+      assert.equal(response.statusCode, 200);
+      assert.equal(observedPath, "/v1/responses");
+      assert.ok(isRecord(observedBody));
+      assert.equal(observedBody.stream, false);
+      assert.equal(observedBody.max_output_tokens, 256);
+      assert.ok(Array.isArray(observedBody.input));
+      assert.ok(Array.isArray(observedBody.tools));
+      assert.ok(isRecord(observedBody.tools[0]));
+      assert.equal(observedBody.tools[0].name, "bash");
+      assert.equal(observedBody.tools[0].type, "function");
+      assert.ok(isRecord(observedBody.tool_choice));
+      assert.equal(observedBody.tool_choice.type, "function");
+      assert.equal(observedBody.tool_choice.name, "bash");
+      assert.ok(isRecord(observedBody.reasoning));
+      assert.equal(observedBody.reasoning.effort, "high");
+      assert.equal(observedBody.reasoning.summary, "auto");
+      assert.ok(isRecord(observedBody.text));
+      assert.equal(observedBody.text.verbosity, "low");
+      assert.ok(Array.isArray(observedBody.include));
+      assert.equal(observedBody.include[0], "reasoning.encrypted_content");
+
+      const payload: unknown = response.json();
+      assert.ok(isRecord(payload));
+      assert.equal(payload.object, "chat.completion");
+      assert.equal(payload.model, "gpt-5.3-codex");
+      assert.ok(Array.isArray(payload.choices));
+      assert.ok(isRecord(payload.choices[0]));
+      assert.ok(isRecord(payload.choices[0].message));
+      assert.equal(payload.choices[0].message.content, "responses-route-ok");
+      assert.ok(isRecord(payload.usage));
+      assert.equal(payload.usage.total_tokens, 13);
+    }
+  );
+});
+
+test("normalizes chat content part type text to responses input_text/output_text", async () => {
+  let observedBody: unknown;
+
+  await withProxyApp(
+    {
+      keys: ["key-a"],
+      upstreamHandler: async (_request, body) => {
+        observedBody = JSON.parse(body);
+
+        return {
+          status: 200,
+          headers: {
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            id: "resp_norm",
+            object: "response",
+            created_at: 1772516803,
+            model: "gpt-5.3-codex",
+            output: [
+              {
+                id: "msg_norm",
+                type: "message",
+                role: "assistant",
+                content: [
+                  {
+                    type: "output_text",
+                    text: "ok"
+                  }
+                ]
+              }
+            ]
+          })
+        };
+      }
+    },
+    async ({ app }) => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/chat/completions",
+        headers: {
+          "content-type": "application/json"
+        },
+        payload: {
+          model: "gpt-5.3-codex",
+          messages: [
+            {
+              role: "system",
+              content: [{ type: "text", text: "system text" }]
+            },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "assistant text" }]
+            },
+            {
+              role: "user",
+              content: [{ type: "text", text: "user text" }]
+            }
+          ],
+          stream: false
+        }
+      });
+
+      assert.equal(response.statusCode, 200);
+      assert.ok(isRecord(observedBody));
+      assert.ok(Array.isArray(observedBody.input));
+      assert.equal(observedBody.input.length, 3);
+
+      assert.ok(isRecord(observedBody.input[0]));
+      assert.ok(Array.isArray(observedBody.input[0].content));
+      assert.ok(isRecord(observedBody.input[0].content[0]));
+      assert.equal(observedBody.input[0].content[0].type, "input_text");
+
+      assert.ok(isRecord(observedBody.input[1]));
+      assert.ok(Array.isArray(observedBody.input[1].content));
+      assert.ok(isRecord(observedBody.input[1].content[0]));
+      assert.equal(observedBody.input[1].content[0].type, "output_text");
+
+      assert.ok(isRecord(observedBody.input[2]));
+      assert.ok(Array.isArray(observedBody.input[2].content));
+      assert.ok(isRecord(observedBody.input[2].content[0]));
+      assert.equal(observedBody.input[2].content[0].type, "input_text");
+    }
+  );
+});
+
+test("maps responses function_call output to chat tool_calls", async () => {
+  await withProxyApp(
+    {
+      keys: ["key-a"],
+      upstreamHandler: async () => ({
+        status: 200,
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          id: "resp_tool_call",
+          object: "response",
+          created_at: 1772516801,
+          model: "gpt-5.3-codex",
+          output: [
+            {
+              id: "fc_1",
+              type: "function_call",
+              call_id: "call_1",
+              name: "bash",
+              arguments: "{\"command\":\"pwd\"}"
+            }
+          ]
+        })
+      })
+    },
+    async ({ app }) => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/chat/completions",
+        headers: {
+          "content-type": "application/json"
+        },
+        payload: {
+          model: "gpt-5.3-codex",
+          messages: [{ role: "user", content: "run pwd" }],
+          stream: false
+        }
+      });
+
+      assert.equal(response.statusCode, 200);
+
+      const payload: unknown = response.json();
+      assert.ok(isRecord(payload));
+      assert.ok(Array.isArray(payload.choices));
+      assert.ok(isRecord(payload.choices[0]));
+      assert.equal(payload.choices[0].finish_reason, "tool_calls");
+      assert.ok(isRecord(payload.choices[0].message));
+      assert.equal(payload.choices[0].message.content, null);
+      assert.ok(Array.isArray(payload.choices[0].message.tool_calls));
+      assert.ok(isRecord(payload.choices[0].message.tool_calls[0]));
+      assert.ok(isRecord(payload.choices[0].message.tool_calls[0].function));
+      assert.equal(payload.choices[0].message.tool_calls[0].function.name, "bash");
+    }
+  );
+});
+
+test("returns synthetic chat-completion SSE for gpt stream requests", async () => {
+  await withProxyApp(
+    {
+      keys: ["key-a"],
+      upstreamHandler: async () => ({
+        status: 200,
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          id: "resp_stream",
+          object: "response",
+          created_at: 1772516802,
+          model: "gpt-5.3-codex",
+          output: [
+            {
+              id: "msg_stream",
+              type: "message",
+              role: "assistant",
+              content: [
+                {
+                  type: "output_text",
+                  text: "stream-via-responses"
+                }
+              ]
+            }
+          ]
+        })
+      })
+    },
+    async ({ app }) => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/chat/completions",
+        headers: {
+          "content-type": "application/json"
+        },
+        payload: {
+          model: "gpt-5.3-codex",
+          messages: [{ role: "user", content: "hello" }],
+          stream: true
+        }
+      });
+
+      assert.equal(response.statusCode, 200);
+      assert.equal(response.headers["content-type"], "text/event-stream; charset=utf-8");
+      assert.ok(response.body.includes("chat.completion.chunk"));
+      assert.ok(response.body.includes("stream-via-responses"));
+      assert.ok(response.body.includes("data: [DONE]"));
     }
   );
 });

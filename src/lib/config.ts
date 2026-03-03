@@ -5,6 +5,8 @@ export interface ProxyConfig {
   readonly port: number;
   readonly upstreamBaseUrl: string;
   readonly chatCompletionsPath: string;
+  readonly responsesPath: string;
+  readonly responsesModelPrefixes: readonly string[];
   readonly keysFilePath: string;
   readonly modelsFilePath: string;
   readonly keyReloadMs: number;
@@ -51,6 +53,20 @@ function filePathFromEnv(name: string, fallback: string, cwd: string): string {
   return resolve(cwd, raw);
 }
 
+function csvFromEnv(name: string, fallback: readonly string[]): string[] {
+  const raw = process.env[name];
+  if (!raw) {
+    return [...fallback];
+  }
+
+  const items = raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+
+  return items.length > 0 ? items : [...fallback];
+}
+
 export function loadConfig(cwd: string = process.cwd()): ProxyConfig {
   const upstreamBaseUrl = (process.env.UPSTREAM_BASE_URL ?? "https://api.vivgrid.com").replace(/\/+$/, "");
 
@@ -59,6 +75,8 @@ export function loadConfig(cwd: string = process.cwd()): ProxyConfig {
     port: numberFromEnv("PROXY_PORT", 8787),
     upstreamBaseUrl,
     chatCompletionsPath: process.env.UPSTREAM_CHAT_COMPLETIONS_PATH ?? "/v1/chat/completions",
+    responsesPath: process.env.UPSTREAM_RESPONSES_PATH ?? "/v1/responses",
+    responsesModelPrefixes: csvFromEnv("UPSTREAM_RESPONSES_MODEL_PREFIXES", ["gpt-"]),
     keysFilePath: filePathFromEnv("VIVGRID_KEYS_FILE", "./keys.json", cwd),
     modelsFilePath: filePathFromEnv("VIVGRID_MODELS_FILE", "./models.json", cwd),
     keyReloadMs: numberFromEnv("VIVGRID_KEY_RELOAD_MS", 5000),
