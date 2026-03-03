@@ -1,0 +1,22 @@
+# Build artifacts
+node_modules/
+dist/
+coverage/
+logs/
+
+# Secrets – NEVER bake these into the image
+.env
+keys.json
+models.json
+
+# Version control
+.git/
+.github/
+
+# Docker files themselves (not needed in build context)
+docker-compose*.yml
+Dockerfile*
+
+# Docs / misc
+*.md
+*.example.*
